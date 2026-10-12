@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{ByteExt, Error, Stream, colors};
+use ::color::{Srgb, parse_color_prefix};
 
 #[cfg(not(feature = "std"))]
 use kurbo::common::FloatFuncs;
 
 /// Representation of the [`<color>`] type.
 ///
-/// [`<color>`]: https://www.w3.org/TR/css-color-3/
+/// Components are stored as eight-bit sRGB, including colors parsed from other color spaces.
+///
+/// [`<color>`]: https://www.w3.org/TR/css-color-4/
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(missing_docs)]
 pub struct Color {
@@ -81,7 +84,7 @@ impl Color {
 impl core::str::FromStr for Color {
     type Err = Error;
 
-    /// Parses [CSS3](https://www.w3.org/TR/css-color-3/) `Color` from a string.
+    /// Parses a CSS color from a string.
     ///
     /// # Errors
     ///
@@ -95,6 +98,8 @@ impl core::str::FromStr for Color {
     ///    There should be a `number`, not an `integer` for percent values ([details]).
     ///  - It also supports 4 digits and 8 digits hex notation from the
     ///    [CSS Color Module Level 4][css-color-4-hex].
+    ///  - Absolute CSS Color 4 functions, including `color(display-p3 ...)`,
+    ///    are converted to eight-bit sRGB.
     ///
     /// [SVG 1.1 spec]: https://www.w3.org/TR/SVG11/types.html#DataTypeColor
     /// [details]: https://lists.w3.org/Archives/Public/www-svg/2014Jan/0109.html
@@ -128,6 +133,24 @@ impl Stream<'_> {
 
     /// Parses a color.
     pub fn parse_color(&mut self) -> Result<Color, Error> {
+        let start = *self;
+        match self.parse_legacy_color() {
+            Ok(color) => Ok(color),
+            Err(error) => {
+                // Keep legacy parsing and diagnostics while admitting modern
+                // color functions at the same value boundary, including filters.
+                let Ok((consumed, color)) = parse_color_prefix(start.slice_tail()) else {
+                    return Err(error);
+                };
+                let color = color.to_alpha_color::<Srgb>().to_rgba8();
+                *self = start;
+                self.advance(consumed);
+                Ok(Color::new_rgba(color.r, color.g, color.b, color.a))
+            }
+        }
+    }
+
+    fn parse_legacy_color(&mut self) -> Result<Color, Error> {
         self.skip_spaces();
 
         let mut color = Color::black();
@@ -641,10 +664,10 @@ mod tests {
         "invalid value"
     );
 
-    test_err!(
+    test!(
         rgba_with_percent_alpha,
         "rgba(10, 20, 30, 5%)",
-        "expected ')' not '%' at position 19"
+        Color::new_rgba(10, 20, 30, 13)
     );
 
     test_err!(
@@ -652,4 +675,79 @@ mod tests {
         "rgb(140%, -10mm, 130pt)",
         "invalid number at position 14"
     );
+}
+
+#[cfg(test)]
+mod css_color_4_tests {
+    use alloc::vec::Vec;
+    use core::str::FromStr;
+
+    use crate::{Color, FilterValue, FilterValueListParser, Paint, PaintFallback, Stream};
+
+    #[test]
+    fn absolute_functions_convert_to_srgb_and_preserve_alpha() {
+        for (source, expected) in [
+            (
+                "color(display-p3 .5 0 0 / 50%)",
+                Color::new_rgba(140, 0, 0, 128),
+            ),
+            ("COLOR(DISPLAY-P3 0 0 1)", Color::blue()),
+            ("lab(100% 0 0)", Color::white()),
+            ("lch(100% 0 0)", Color::white()),
+            ("oklab(1 0 0)", Color::white()),
+            ("oklch(1 0 0)", Color::white()),
+            ("hwb(0 0% 0% / 50%)", Color::new_rgba(255, 0, 0, 128)),
+            ("rgb(255 0 0 / 50%)", Color::new_rgba(255, 0, 0, 128)),
+        ] {
+            assert_eq!(Color::from_str(source).unwrap(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn paint_url_fallback_accepts_display_p3() {
+        assert_eq!(
+            Paint::from_str("url(#gradient) color(display-p3 .5 0 0 / .5)").unwrap(),
+            Paint::FuncIRI(
+                "gradient",
+                Some(PaintFallback::Color(Color::new_rgba(140, 0, 0, 128)))
+            )
+        );
+    }
+
+    #[test]
+    fn filter_colors_do_not_consume_lengths_or_following_functions() {
+        for source in [
+            "drop-shadow(color(display-p3 .5 0 0 / .5) 1px 2px) blur(3px)",
+            "drop-shadow(1px 2px color(display-p3 .5 0 0 / .5)) blur(3px)",
+        ] {
+            let values = FilterValueListParser::from(source)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let FilterValue::DropShadow { color, dx, dy, .. } = values[0] else {
+                panic!("expected drop-shadow");
+            };
+            assert_eq!(color, Some(Color::new_rgba(140, 0, 0, 128)));
+            assert_eq!(dx.number, 1.0);
+            assert_eq!(dy.number, 2.0);
+            assert!(matches!(values[1], FilterValue::Blur(length) if length.number == 3.0));
+            assert_eq!(values.len(), 2);
+        }
+    }
+
+    #[test]
+    fn invalid_functions_and_trailing_values_are_rejected() {
+        for source in [
+            "color(display-p3 nope) 1px",
+            "color(unknown-space 0 0 0)",
+            "color(display-p3 1 0)",
+            "lab(50% 0 0",
+        ] {
+            let mut stream = Stream::from(source);
+            let start = stream;
+            assert!(stream.try_parse_color().is_none(), "{source}");
+            assert_eq!(stream, start);
+            assert!(Color::from_str(source).is_err());
+        }
+        assert!(Color::from_str("color(display-p3 1 0 0) trailing").is_err());
+    }
 }

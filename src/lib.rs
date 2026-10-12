@@ -6,7 +6,7 @@
 
 ## Supported SVG types
 
-- [`<color>`](https://www.w3.org/TR/css-color-3/)
+- [`<color>`](https://www.w3.org/TR/css-color-4/) (stored as eight-bit sRGB)
 - [`<number>`](https://www.w3.org/TR/SVG2/types.html#InterfaceSVGNumber)
 - [`<length>`](https://www.w3.org/TR/SVG2/types.html#InterfaceSVGLength)
 - [`<angle>`](https://www.w3.org/TR/SVG2/types.html#InterfaceSVGAngle)

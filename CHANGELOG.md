@@ -15,6 +15,11 @@ You can find its changes [documented below](#0161-2026-01-09).
 
 This release has an [MSRV][] of 1.85.
 
+### Added
+
+- Parse absolute CSS Color 4 functions, including Display P3, Lab, LCH, Oklab, Oklch,
+  and HWB, converting their values to eight-bit sRGB while preserving alpha.
+
 ### Changed
 
 - Require at least one fractional digit after a decimal point in the shared number parser.
