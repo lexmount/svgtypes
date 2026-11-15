@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{Error, Stream};
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 
 /// Representation of a path segment.
 ///
@@ -722,7 +722,7 @@ pub struct SimplifyingPathParser<'a> {
     prev_seg: PathSegment,
     prev_simple_seg: Option<SimplePathSegment>,
 
-    buffer: Vec<SimplePathSegment>,
+    buffer: VecDeque<SimplePathSegment>,
 }
 
 impl<'a> From<&'a str> for SimplifyingPathParser<'a> {
@@ -742,7 +742,7 @@ impl<'a> From<&'a str> for SimplifyingPathParser<'a> {
                 y: 0.0,
             },
             prev_simple_seg: None,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
         }
     }
 }
@@ -751,8 +751,8 @@ impl Iterator for SimplifyingPathParser<'_> {
     type Item = Result<SimplePathSegment, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.buffer.is_empty() {
-            return Some(Ok(self.buffer.remove(0)));
+        if let Some(segment) = self.buffer.pop_front() {
+            return Some(Ok(segment));
         }
 
         let segment = match self.parser.next()? {
@@ -770,7 +770,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                         x: self.prev_mx,
                         y: self.prev_my,
                     };
-                    self.buffer.push(new_seg);
+                    self.buffer.push_back(new_seg);
                     self.prev_simple_seg = Some(new_seg);
                 }
             }
@@ -790,7 +790,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     }
                 }
 
-                self.buffer.push(SimplePathSegment::MoveTo { x, y });
+                self.buffer.push_back(SimplePathSegment::MoveTo { x, y });
                 self.prev_seg = segment;
             }
             PathSegment::LineTo { abs, mut x, mut y } => {
@@ -799,7 +799,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     y += self.prev_y;
                 }
 
-                self.buffer.push(SimplePathSegment::LineTo { x, y });
+                self.buffer.push_back(SimplePathSegment::LineTo { x, y });
                 self.prev_seg = segment;
             }
             PathSegment::HorizontalLineTo { abs, mut x } => {
@@ -808,7 +808,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::LineTo { x, y: self.prev_y });
+                    .push_back(SimplePathSegment::LineTo { x, y: self.prev_y });
                 self.prev_seg = segment;
             }
             PathSegment::VerticalLineTo { abs, mut y } => {
@@ -817,7 +817,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::LineTo { x: self.prev_x, y });
+                    .push_back(SimplePathSegment::LineTo { x: self.prev_x, y });
                 self.prev_seg = segment;
             }
             PathSegment::CurveTo {
@@ -838,7 +838,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     y += self.prev_y;
                 }
 
-                self.buffer.push(SimplePathSegment::CurveTo {
+                self.buffer.push_back(SimplePathSegment::CurveTo {
                     x1,
                     y1,
                     x2,
@@ -885,7 +885,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     y += self.prev_y;
                 }
 
-                self.buffer.push(SimplePathSegment::CurveTo {
+                self.buffer.push_back(SimplePathSegment::CurveTo {
                     x1,
                     y1,
                     x2,
@@ -918,7 +918,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::Quadratic { x1, y1, x, y });
+                    .push_back(SimplePathSegment::Quadratic { x1, y1, x, y });
 
                 // Remember as absolute.
                 self.prev_seg = PathSegment::Quadratic {
@@ -952,7 +952,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                 }
 
                 self.buffer
-                    .push(SimplePathSegment::Quadratic { x1, y1, x, y });
+                    .push_back(SimplePathSegment::Quadratic { x1, y1, x, y });
 
                 // Remember as absolute.
                 self.prev_seg = PathSegment::SmoothQuadratic { abs: true, x, y };
@@ -983,8 +983,15 @@ impl Iterator for SimplifyingPathParser<'_> {
 
                 match kurbo::Arc::from_svg_arc(&svg_arc) {
                     Some(arc) => {
-                        arc.to_cubic_beziers(0.1, |p1, p2, p| {
-                            self.buffer.push(SimplePathSegment::CurveTo {
+                        // An absolute tolerance below the coordinates' numeric
+                        // precision can request millions of cubic segments.
+                        // Keep the usual 0.1-unit tolerance at ordinary scales,
+                        // and allow a small rounding-sized error at huge scales.
+                        // This bounds subdivision without truncating the arc.
+                        let tolerance =
+                            0.1_f64.max(arc.radii.x.max(arc.radii.y) * (16.0 * f64::EPSILON));
+                        arc.to_cubic_beziers(tolerance, |p1, p2, p| {
+                            self.buffer.push_back(SimplePathSegment::CurveTo {
                                 x1: p1.x,
                                 y1: p1.y,
                                 x2: p2.x,
@@ -993,9 +1000,19 @@ impl Iterator for SimplifyingPathParser<'_> {
                                 y: p.y,
                             });
                         });
+                        // Ellipse-center arithmetic loses low coordinate bits
+                        // at large scales. The authored endpoint is exact and
+                        // also anchors any subsequent relative command.
+                        if let Some(SimplePathSegment::CurveTo {
+                            x: end_x, y: end_y, ..
+                        }) = self.buffer.back_mut()
+                        {
+                            *end_x = x;
+                            *end_y = y;
+                        }
                     }
                     None => {
-                        self.buffer.push(SimplePathSegment::LineTo { x, y });
+                        self.buffer.push_back(SimplePathSegment::LineTo { x, y });
                     }
                 }
 
@@ -1006,7 +1023,7 @@ impl Iterator for SimplifyingPathParser<'_> {
                     // Do not add sequential ClosePath segments.
                     // Otherwise it will break markers rendering.
                 } else {
-                    self.buffer.push(SimplePathSegment::ClosePath);
+                    self.buffer.push_back(SimplePathSegment::ClosePath);
                 }
 
                 self.prev_seg = segment;
@@ -1014,7 +1031,7 @@ impl Iterator for SimplifyingPathParser<'_> {
         }
 
         // Remember last position.
-        if let Some(new_segment) = self.buffer.last() {
+        if let Some(new_segment) = self.buffer.back() {
             self.prev_simple_seg = Some(*new_segment);
 
             match *new_segment {
@@ -1048,7 +1065,7 @@ impl Iterator for SimplifyingPathParser<'_> {
             return self.next();
         }
 
-        Some(Ok(self.buffer.remove(0)))
+        self.buffer.pop_front().map(Ok)
     }
 }
 
@@ -1101,12 +1118,12 @@ mod simple_tests {
         SimplePathSegment::CurveTo {
             x1: 1.0, y1: 3.4262134833347355,
             x2: 1.7409707866677877, y2: 1.9442719099991592,
-            x: 2.9999999999999996, y: 1.0000000000000004
+            x: 3.0, y: 1.0
         },
         SimplePathSegment::CurveTo {
-            x1: 2.9999999999999996, y1: 1.0000000000000004,
-            x2: 6.0, y2: 3.0000000000000004,
-            x: 11.0, y: 3.0000000000000004
+            x1: 3.0, y1: 1.0,
+            x2: 6.0, y2: 3.0,
+            x: 11.0, y: 3.0
         }
     );
 
@@ -1168,11 +1185,11 @@ mod simple_tests {
         SimplePathSegment::CurveTo {
             x1: 1.0, y1: 3.4262134833347355,
             x2: 1.7409707866677877, y2: 1.9442719099991592,
-            x: 2.9999999999999996, y: 1.0000000000000004
+            x: 3.0, y: 1.0
         },
         SimplePathSegment::Quadratic {
-            x1: 2.9999999999999996, y1: 1.0000000000000004,
-            x: 11.0, y: 3.0000000000000004
+            x1: 3.0, y1: 1.0,
+            x: 11.0, y: 3.0
         }
     );
 
@@ -1214,6 +1231,86 @@ mod simple_tests {
             assert_eq!(y.round(), 100.0);
         } else {
             panic!("invalid type");
+        }
+    }
+}
+
+#[cfg(test)]
+mod extreme_arc_tests {
+    use super::*;
+    use alloc::{format, vec::Vec};
+
+    fn bounded_segments(source: &str) -> Vec<SimplePathSegment> {
+        let segments = SimplifyingPathParser::from(source)
+            .take(513)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            segments.len() < 512,
+            "arc expansion exceeded the numeric precision budget: {source}"
+        );
+        assert!(
+            segments
+                .iter()
+                .any(|segment| matches!(segment, SimplePathSegment::CurveTo { .. })),
+            "the arc must be retained: {source}"
+        );
+        for segment in &segments {
+            if let SimplePathSegment::CurveTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                x,
+                y,
+            } = *segment
+            {
+                assert!(
+                    [x1, y1, x2, y2, x, y].into_iter().all(f64::is_finite),
+                    "{source}: {segment:?}"
+                );
+            }
+        }
+        segments
+    }
+
+    #[test]
+    fn huge_svg_arc_keeps_the_endpoint_and_following_relative_line() {
+        let segments = bounded_segments("M0 0 A743 -417 0 1 1 7 1e38 l3 -1e37");
+        assert_eq!(segments[0], SimplePathSegment::MoveTo { x: 0.0, y: 0.0 });
+        assert!(matches!(
+            segments[segments.len() - 2],
+            SimplePathSegment::CurveTo {
+                x: 7.0,
+                y: 1e38,
+                ..
+            }
+        ));
+        assert_eq!(
+            segments.last(),
+            Some(&SimplePathSegment::LineTo {
+                x: 10.0,
+                y: 1e38 - 1e37
+            })
+        );
+    }
+
+    #[test]
+    fn huge_svg_arcs_remain_bounded_across_scales_flags_and_rotations() {
+        for end in [1e20, 1e30, 1e38] {
+            for rotation in [0, 45, 270] {
+                for large_arc in [0, 1] {
+                    for sweep in [0, 1] {
+                        let source =
+                            format!("M0 0 A743 -417 {rotation} {large_arc} {sweep} 7 {end}");
+                        let segments = bounded_segments(&source);
+                        assert!(
+                            matches!(segments.last(), Some(SimplePathSegment::CurveTo { x, y, .. }) if *x==7.0 && *y==end),
+                            "{source}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
